@@ -230,6 +230,8 @@ bool OrchDaemon::init()
     gDirectory.set(vxlan_tunnel_map_orch);
     VxlanVrfMapOrch *vxlan_vrf_orch = new VxlanVrfMapOrch(m_applDb, APP_VXLAN_VRF_TABLE_NAME);
     gDirectory.set(vxlan_vrf_orch);
+    VxlanDataplaneTunnelOrch *vxlan_dataplane_tunnel_orch = new VxlanDataplaneTunnelOrch(m_applDb, APP_VXLAN_DATAPLANE_VTEP_TABLE_NAME);
+    gDirectory.set(vxlan_dataplane_tunnel_orch);
 
 
     EvpnNvoOrch* evpn_nvo_orch = new EvpnNvoOrch(m_applDb, APP_VXLAN_EVPN_NVO_TABLE_NAME);
@@ -483,6 +485,7 @@ bool OrchDaemon::init()
     m_orchList.push_back(vxlan_tunnel_orch);
     m_orchList.push_back(evpn_nvo_orch);
     m_orchList.push_back(vxlan_tunnel_map_orch);
+    m_orchList.push_back(vxlan_dataplane_tunnel_orch);
 
     if (vxlan_tunnel_orch->isDipTunnelsSupported())
     {
@@ -495,6 +498,13 @@ bool OrchDaemon::init()
         EvpnRemoteVnip2mpOrch* evpn_remote_vni_orch = new EvpnRemoteVnip2mpOrch(m_applDb, APP_VXLAN_REMOTE_VNI_TABLE_NAME);
         gDirectory.set(evpn_remote_vni_orch);
         m_orchList.push_back(evpn_remote_vni_orch);
+    }
+
+    if (vxlan_tunnel_orch->isDipTunnelsSupported())
+    {
+        DataplaneRemoteVniOrch* dataplane_remote_vni_orch = new DataplaneRemoteVniOrch(m_applDb, APP_VXLAN_DATAPLANE_REMOTE_VNI_TABLE_NAME);
+        gDirectory.set(dataplane_remote_vni_orch);
+        m_orchList.push_back(dataplane_remote_vni_orch);
     }
 
     m_orchList.push_back(vxlan_vrf_orch);

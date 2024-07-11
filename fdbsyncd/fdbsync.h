@@ -47,7 +47,7 @@ class FdbSync : public NetMsg
 public:
     enum { MAX_ADDR_SIZE = 64 };
 
-    FdbSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *config_db);
+    FdbSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *config_db, DBConnector *appDb);
     ~FdbSync();
 
     virtual void onMsg(int nlmsg_type, struct nl_object *obj);
@@ -74,15 +74,24 @@ public:
         return &m_cfgEvpnNvoTable;
     }
 
+    SubscriberStateTable *getDataplaneTunnelTable()
+    {
+        return &m_appDataplaneNvoTable;
+    }
+
     void processStateFdb();
 
     void processStateMclagRemoteFdb();
 
     void processCfgEvpnNvo();
 
+    void processDataplaneTunnelNvo();
+
     bool m_reconcileDone = false;
 
     bool m_isEvpnNvoExist = false;
+
+    bool m_isDataplaneVxlanExist = false;
 
 private:
     ProducerStateTable m_fdbTable;
@@ -91,6 +100,7 @@ private:
     SubscriberStateTable m_mclagRemoteFdbStateTable;
     AppRestartAssist  *m_AppRestartAssist;
     SubscriberStateTable m_cfgEvpnNvoTable;
+    SubscriberStateTable m_appDataplaneNvoTable;
 
     struct m_local_fdb_info
     {

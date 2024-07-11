@@ -21,7 +21,7 @@ int main(int argc, char **argv)
     DBConnector stateDb(STATE_DB, DBConnector::DEFAULT_UNIXSOCKET, 0);
     DBConnector config_db(CONFIG_DB, DBConnector::DEFAULT_UNIXSOCKET, 0);
 
-    FdbSync sync(&pipelineAppDB, &stateDb, &config_db);
+    FdbSync sync(&pipelineAppDB, &stateDb, &config_db, &appDb);
 
     NetDispatcher::getInstance().registerMessageHandler(RTM_NEWNEIGH, &sync);
     NetDispatcher::getInstance().registerMessageHandler(RTM_DELNEIGH, &sync);
@@ -87,6 +87,7 @@ int main(int argc, char **argv)
             s.addSelectable(sync.getFdbStateTable());
             s.addSelectable(sync.getMclagRemoteFdbStateTable());
             s.addSelectable(sync.getCfgEvpnNvoTable());
+            s.addSelectable(sync.getDataplaneTunnelTable());
             while (true)
             {
                 s.select(&temps);
@@ -102,6 +103,10 @@ int main(int argc, char **argv)
                 else if (temps == (Selectable *)sync.getCfgEvpnNvoTable())
                 {
                     sync.processCfgEvpnNvo();
+                }
+                else if (temps == (Selectable *)sync.getDataplaneTunnelTable())
+                {
+                    sync.processDataplaneTunnelNvo();
                 }
                 else if (temps == &replayCheckTimer)
                 {

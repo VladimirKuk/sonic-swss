@@ -28,6 +28,7 @@ public:
         std::string m_vxlan;
         std::string m_vxlanIf;
         std::string m_macAddress;
+        std::string m_dstIp;
     } VxlanInfo;
 
     typedef struct TunCache
@@ -36,6 +37,14 @@ public:
         std::string m_sourceIp;
         uint32_t vlan_vni_refcnt;
     } TunCache;
+
+    typedef struct TunRemoteCache
+    {
+        std::vector<FieldValueTuple> fvt;
+        std::string m_sourceIp;
+        uint32_t vni_refcnt;
+        std::string m_localVtepIp;
+    } TunRemoteCache;
 
     typedef struct MapCache
     {
@@ -49,6 +58,7 @@ public:
     void endReconcile(bool warm);
     void restoreVxlanNetDevices();
     bool isTunnelActive(std::string vxlanTunnelName);
+    bool isRemoteTunnelActive(std::string vxlanRemoteTunnelName);
 
     ~VxlanMgr();
 private:
@@ -63,6 +73,12 @@ private:
     bool doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t);
     bool doVxlanTunnelMapDeleteTask(const KeyOpFieldsValuesTuple & t);
 
+    bool doVxlanRemoteTunnelCreateTask(const KeyOpFieldsValuesTuple & t);
+    bool doVxlanRemoteTunnelDeleteTask(const KeyOpFieldsValuesTuple & t);
+
+    bool doVxlanRemoteTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t);
+    bool doVxlanRemoteTunnelMapDeleteTask(const KeyOpFieldsValuesTuple & t);
+
     bool doVxlanEvpnNvoCreateTask(const KeyOpFieldsValuesTuple & t);
     bool doVxlanEvpnNvoDeleteTask(const KeyOpFieldsValuesTuple & t);
 
@@ -70,6 +86,9 @@ private:
     void delAppDBTunnelMapTable(std::string vxlanTunnelMapName);
     int createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_id,
                              std::string src_ip, std::string dst_ip, std::string vlan_id);
+    int createVxlanNetdeviceForRemoteVtep(std::string vxlanTunnelName, std::string vni_id,
+                                          std::string src_ip, std::string dst_ip,
+                                          std::string vlan_id);
     int downVxlanNetdevice(std::string vxlan_dev_name);
     int deleteVxlanNetdevice(std::string vxlan_dev_name);
     std::vector<std::string> parseNetDev(const std::string& stdout);
@@ -90,8 +109,9 @@ private:
     bool deleteVxlan(const VxlanInfo & info);
 
     void clearAllVxlanDevices();
+    bool getFirstActiveTunnel(std::string &vxlanTunnelName);
 
-    ProducerStateTable m_appVxlanTunnelTable,m_appVxlanTunnelMapTable,m_appEvpnNvoTable;
+    ProducerStateTable m_appVxlanTunnelTable,m_appVxlanTunnelMapTable,m_appEvpnNvoTable, m_appVxlanDataplaneVtepTable, m_appVxlanRemoteVniTable;
     Table m_cfgVxlanTunnelTable,m_cfgVnetTable,m_stateVrfTable,m_stateVxlanTable, m_appSwitchTable;
     Table m_stateVlanTable, m_stateNeighSuppressVlanTable, m_stateVxlanTunnelTable;
 
@@ -105,6 +125,9 @@ private:
     std::map<std::string, std::string> m_vlanMapCache;
     std::map<std::string, std::string> m_vniMapCache;
     std::map<std::string, std::string> m_EvpnNvoCache;
+    std::map<std::string, TunRemoteCache> m_vxlanRemoteVtepCache;
+    std::map<std::string, std::string> m_vxlanRemoteTunnelMapCache;
+
 
     /*
     * Vnet Cache

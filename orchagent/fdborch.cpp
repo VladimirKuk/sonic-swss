@@ -114,6 +114,20 @@ bool FdbOrch::storeFdbEntryState(const FdbUpdate& update)
         fdbdata.remote_ip = "";
         fdbdata.esi = "";
         fdbdata.vni = 0;
+        if (update.port.m_type == Port::TUNNEL)
+        {
+            VxlanTunnelOrch* tunnel_orch = gDirectory.get<VxlanTunnelOrch*>();
+            if (tunnel_orch->isDipTunnelsSupported())
+            {
+                VxlanDataplaneTunnelOrch* dt_orch = gDirectory.get<VxlanDataplaneTunnelOrch*>();
+                if (dt_orch && dt_orch->getLocalVtep())
+                {
+                    Port tmp_port = update.port;
+                    tunnel_orch->getTunnelDIPFromPort(tmp_port, fdbdata.remote_ip);
+                    fdbdata.vni = update.port.m_vnid;
+                }
+            }
+        }
 
         m_entries[entry] = fdbdata;
         SWSS_LOG_INFO("FdbOrch notification: mac %s was inserted in port %s into bv_id 0x%" PRIx64,
@@ -605,7 +619,7 @@ void FdbOrch::update(sai_fdb_event_t        type,
         }
 
         update.add = true;
-	update.entry.port_name = update.port.m_alias;
+	    update.entry.port_name = update.port.m_alias;
         if (!port_old.m_alias.empty())
         {
             port_old.m_fdb_count--;
@@ -824,10 +838,9 @@ void FdbOrch::doTask(Consumer& consumer)
             /* FDB type is either dynamic or static */
             assert(type == "dynamic" || type == "dynamic_local" || type == "static" );
 
+            VxlanTunnelOrch* tunnel_orch = gDirectory.get<VxlanTunnelOrch*>();
             if(origin == FDB_ORIGIN_VXLAN_ADVERTIZED)
             {
-                VxlanTunnelOrch* tunnel_orch = gDirectory.get<VxlanTunnelOrch*>();
-
                 if (tunnel_orch->isDipTunnelsSupported())
                 {
                     if(!remote_ip.length())
@@ -847,6 +860,23 @@ void FdbOrch::doTask(Consumer& consumer)
                         continue;
                     }
                     port = tunnel_orch->getTunnelPortName(sip_tunnel->getSrcIP().to_string(), true);
+                }
+            }
+            else if (tunnel_orch->isDipTunnelsSupported())
+            {
+                VxlanDataplaneTunnelOrch* dt_nvo_orch = gDirectory.get<VxlanDataplaneTunnelOrch*>();
+                if (dt_nvo_orch)
+                {
+                    VxlanTunnel* sip_tunnel = dt_nvo_orch->getLocalVtep();
+                    if (sip_tunnel == NULL)
+                    {
+                        it = consumer.m_toSync.erase(it);
+                        continue;
+                    }
+                    port = tunnel_orch->getTunnelPortName(sip_tunnel->getSrcIP().to_string(), true); 
+                    Port tunnelPort(port, Port::TUNNEL);
+                    tunnel_orch->getTunnelDIPFromPort(tunnelPort, remote_ip);
+                    vni = tunnel_orch->getVniMappedToVlan((uint16_t)vlan.m_vlan_info.vlan_id);
                 }
             }
 

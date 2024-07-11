@@ -36,6 +36,8 @@ extern MacAddress gMacAddress;
 #define VLAN "vlan"
 #define DST_IP "dst_ip"
 #define SOURCE_VTEP "source_vtep"
+#define NVO_TYPE "type"
+#define NVO_TYPE_DATA_PLANE "DATA_PLANE"
 
 static std::string getVxlanName(const swss::VxlanMgr::VxlanInfo & info)
 {
@@ -169,6 +171,42 @@ static int cmdDetachVxlanIfFromVnet(const swss::VxlanMgr::VxlanInfo & info, std:
     return swss::exec(cmd.str(), res);
 }
 
+static int cmdEnableLearningOnVxlanIf(const swss::VxlanMgr::VxlanInfo & info, std::string & res)
+{
+    // bridge link set dev {{VXLAN_IF}} learning on
+    ostringstream cmd;
+    cmd << BRIDGE_CMD  " link set dev "
+        << shellquote(info.m_vxlan)
+        << " learning on ";
+    return swss::exec(cmd.str(), res);
+}
+
+static int cmdEnableIngressReplicationOnVxlanIf(const swss::VxlanMgr::VxlanInfo & info, std::string & res)
+{
+    // bridge fdb append 00:00:00:00:00:00 dst {{DST_IP}} dev {{VXLAN_IF}} vni {{VNI}} static
+    ostringstream cmd;
+    cmd << BRIDGE_CMD  " fdb append 00:00:00:00:00:00 dst "
+        << shellquote(info.m_dstIp)
+        << " dev "
+        << shellquote(info.m_vxlan)
+        << " vni " << shellquote(info.m_vni)
+        << " static ";
+    return swss::exec(cmd.str(), res);
+}
+
+static int cmdDisableIngressReplicationOnVxlanIf(const swss::VxlanMgr::VxlanInfo & info, std::string & res)
+{
+    // bridge fdb del 00:00:00:00:00:00 dst {{DST_IP}} dev {{VXLAN_IF}} vni {{VNI}} static
+    ostringstream cmd;
+    cmd << BRIDGE_CMD  " fdb del 00:00:00:00:00:00 dst "
+        << shellquote(info.m_dstIp)
+        << " dev "
+        << shellquote(info.m_vxlan)
+        << " vni " << shellquote(info.m_vni)
+        << " static ";
+    return swss::exec(cmd.str(), res);
+}
+
 // Vxlanmgr
 
 VxlanMgr::VxlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, const vector<std::string> &tables) :
@@ -184,7 +222,9 @@ VxlanMgr::VxlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb,
         m_stateVxlanTable(stateDb, STATE_VXLAN_TABLE_NAME),
         m_stateVlanTable(stateDb, STATE_VLAN_TABLE_NAME),
         m_stateNeighSuppressVlanTable(stateDb, STATE_NEIGH_SUPPRESS_VLAN_TABLE_NAME),
-        m_stateVxlanTunnelTable(stateDb, STATE_VXLAN_TUNNEL_TABLE_NAME)
+        m_stateVxlanTunnelTable(stateDb, STATE_VXLAN_TUNNEL_TABLE_NAME),
+        m_appVxlanDataplaneVtepTable(appDb, APP_VXLAN_DATAPLANE_VTEP_TABLE_NAME),
+        m_appVxlanRemoteVniTable(appDb, APP_VXLAN_DATAPLANE_REMOTE_VNI_TABLE_NAME)
 {
     getAllVxlanNetDevices();
 
@@ -231,6 +271,14 @@ void VxlanMgr::doTask(Consumer &consumer)
             {
                 task_result = doVxlanEvpnNvoCreateTask(t);
             }
+            else if (table_name == CFG_VXLAN_REMOTE_TUNNEL_TABLE_NAME)
+            {
+                task_result = doVxlanRemoteTunnelCreateTask(t);
+            }
+            else if (table_name == CFG_VXLAN_REMOTE_TUNNEL_MAP_TABLE_NAME)
+            {
+                task_result = doVxlanRemoteTunnelMapCreateTask(t);
+            }
             else
             {
                 SWSS_LOG_ERROR("Unknown table : %s", table_name.c_str());
@@ -253,6 +301,14 @@ void VxlanMgr::doTask(Consumer &consumer)
             else if (table_name == CFG_VXLAN_EVPN_NVO_TABLE_NAME)
             {
                 task_result = doVxlanEvpnNvoDeleteTask(t);
+            }
+            else if (table_name == CFG_VXLAN_REMOTE_TUNNEL_TABLE_NAME)
+            {
+                task_result = doVxlanRemoteTunnelDeleteTask(t);
+            }
+            else if (table_name == CFG_VXLAN_REMOTE_TUNNEL_MAP_TABLE_NAME)
+            {
+                task_result = doVxlanRemoteTunnelMapDeleteTask(t);
             }
             else
             {
@@ -427,6 +483,88 @@ bool VxlanMgr::doVxlanTunnelCreateTask(const KeyOpFieldsValuesTuple & t)
     return true;
 }
 
+
+bool VxlanMgr::doVxlanRemoteTunnelCreateTask(const KeyOpFieldsValuesTuple & t)
+{
+    SWSS_LOG_ENTER();
+
+    const std::string & vxlanRemoteTunnelName = kfvKey(t);
+    
+    // Update vxlan remote tunnel cache
+    TunRemoteCache tuncache;
+
+    // verify if there is a conflict with EVPN NVO
+    if (! m_EvpnNvoCache.empty())
+    {
+        SWSS_LOG_WARN("Cannot configure dataplane remote VTEP when EVPN is inuse");
+        return true;
+    }
+
+    if (isRemoteTunnelActive(vxlanRemoteTunnelName))
+    {
+        SWSS_LOG_WARN("VXLANRemoteTunnel: Remote VTEP %s already exists", vxlanRemoteTunnelName.c_str());
+        return true;
+    }
+
+    tuncache.fvt = kfvFieldsValues(t);
+    tuncache.vni_refcnt = 0;
+    tuncache.m_sourceIp = "NULL";
+
+    for (auto i : kfvFieldsValues(t))
+    {
+        const std::string & field = fvField(i);
+        const std::string & value = fvValue(i);
+        if (field == SOURCE_IP)
+        {
+            tuncache.m_sourceIp = value;
+        }
+    }
+
+    // if first remote VTEP is configured, set source VTEP and enable learning on all data plane tunnels
+    std::string sourceVtep;
+    if (!getFirstActiveTunnel(sourceVtep))
+    {
+        SWSS_LOG_ERROR("Failed to get source VTEP");
+        return true;
+    }
+
+    if (m_vxlanRemoteVtepCache.empty())
+    {
+        vector<FieldValueTuple> fvVector;
+        FieldValueTuple s(SOURCE_VTEP, sourceVtep);
+        fvVector.push_back(s);
+        m_appVxlanDataplaneVtepTable.set(NVO_TYPE_DATA_PLANE, fvVector);
+
+        // run over all created interfaces and enable learning for data plane tunnels
+        std::map<std::string, MapCache>::iterator it;
+        for (it = m_vxlanTunnelMapCache.begin(); it != m_vxlanTunnelMapCache.end(); it++)
+        {
+            size_t found = it->first.find(delimiter);
+            const auto vxlanTunnelName = it->first.substr(0, found);
+            if (vxlanTunnelName == sourceVtep)
+            {
+                swss::VxlanMgr::VxlanInfo info;
+                std::string res;
+                info.m_vxlan = it->second.vxlan_dev_name;
+                info.m_vni = it->second.vni_id;
+                SWSS_LOG_INFO("Enable learning on %s", info.m_vxlan.c_str());
+                if (RET_SUCCESS != cmdEnableLearningOnVxlanIf(info, res))
+                {
+                    SWSS_LOG_ERROR("Failed to enable learning on vxlan interface %s. res %s", info.m_vxlan.c_str(), res.c_str());
+                }
+            }
+        }
+    }
+
+    // create bridge port for remote VTEP
+
+    m_vxlanRemoteVtepCache[vxlanRemoteTunnelName] = tuncache;
+    m_vxlanRemoteVtepCache[vxlanRemoteTunnelName].m_localVtepIp = sourceVtep;
+
+    SWSS_LOG_NOTICE("VXLANRemoteTunnel: Create vxlan remote tunnel %s", vxlanRemoteTunnelName.c_str());
+    return true;
+}
+
 bool VxlanMgr::doVxlanTunnelDeleteTask(const KeyOpFieldsValuesTuple & t)
 {
     SWSS_LOG_ENTER();
@@ -461,6 +599,27 @@ bool VxlanMgr::doVxlanTunnelDeleteTask(const KeyOpFieldsValuesTuple & t)
     }
 
     SWSS_LOG_NOTICE("Delete vxlan tunnel %s", vxlanTunnelName.c_str());
+    return true;
+}
+
+bool VxlanMgr::doVxlanRemoteTunnelDeleteTask(const KeyOpFieldsValuesTuple & t)
+{
+    SWSS_LOG_ENTER();
+
+    const std::string & vxlanRemoteTunnelName = kfvKey(t);
+
+    if (isRemoteTunnelActive(vxlanRemoteTunnelName))
+    {
+        m_vxlanRemoteVtepCache.erase(vxlanRemoteTunnelName);
+    }
+
+    if (m_vxlanRemoteVtepCache.empty())
+    {
+        SWSS_LOG_NOTICE("VXLANRemoteTunnel: Last Remote VTEP %s was removed - clear dataplane source VTEP", vxlanRemoteTunnelName.c_str());
+        m_appVxlanDataplaneVtepTable.del(NVO_TYPE_DATA_PLANE);
+    }
+
+    SWSS_LOG_NOTICE("VXLANRemoteTunnel: Delete vxlan remote tunnel %s", vxlanRemoteTunnelName.c_str());
     return true;
 }
 
@@ -581,13 +740,17 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
     }
 
     createAppDBTunnelMapTable(t);
+    SWSS_LOG_WARN("Create netdev for %s VNI(%s) VLAN(%s) - enter", 
+                       vxlanTunnelName.c_str(), vni_id.c_str(), vlan_id.c_str());
     ret = createVxlanNetdevice(vxlanTunnelName, vni_id, src_ip, dst_ip, vlan_id);
+    SWSS_LOG_WARN("Create netdev for %s VNI(%s) VLAN(%s) - enter", 
+                       vxlanTunnelName.c_str(), vni_id.c_str(), vlan_id.c_str());
     if (ret != RET_SUCCESS)
     {
         SWSS_LOG_WARN("Vxlan Net Dev creation failure for %s VNI(%s) VLAN(%s)", 
                        vxlanTunnelName.c_str(), vni_id.c_str(), vlan_id.c_str());
     }
-    
+
     std::string vxlan_dev_name;
     vxlan_dev_name = std::string("") + std::string(vxlanTunnelName) + "-" + std::string(vlan_id);
 
@@ -607,6 +770,85 @@ bool VxlanMgr::doVxlanTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
     FieldValueTuple s("netdev", vxlan_dev_name);
     fvVector.push_back(s);
     m_stateNeighSuppressVlanTable.set(key,fvVector);
+
+    return true;
+}
+
+
+bool VxlanMgr::doVxlanRemoteTunnelMapCreateTask(const KeyOpFieldsValuesTuple & t)
+{
+    SWSS_LOG_ENTER();
+
+    std::string vxlanRemoteTunnelMapName = kfvKey(t);
+    std::replace(vxlanRemoteTunnelMapName.begin(), vxlanRemoteTunnelMapName.end(), config_db_key_delimiter, delimiter);
+
+    SWSS_LOG_INFO("VXLANRemoteTunnel: Create vxlan remote tunnel map %s", vxlanRemoteTunnelMapName.c_str());
+
+    if (m_vxlanRemoteTunnelMapCache.find(vxlanRemoteTunnelMapName) != m_vxlanRemoteTunnelMapCache.end())
+    {
+        SWSS_LOG_ERROR("VXLANRemoteTunnel: Map already present : %s", vxlanRemoteTunnelMapName.c_str());
+        return true;
+    }
+
+    std::string vni_id;
+    for (auto i : kfvFieldsValues(t))
+    {
+        const std::string & field = fvField(i);
+        const std::string & value = fvValue(i);
+        if (field == VNI)
+        {
+            vni_id = value;
+        }
+    }
+
+    size_t found = vxlanRemoteTunnelMapName.find(delimiter);
+    const auto vxlanRemoteTunnelName = vxlanRemoteTunnelMapName.substr(0, found);
+
+    // If the vxlan tunnel has been created
+    if (!isRemoteTunnelActive(vxlanRemoteTunnelName))
+    {
+        SWSS_LOG_INFO("VXLANRemoteTunnel: Vxlan remote tunnel %s has not been created", vxlanRemoteTunnelName.c_str());
+        // Suspend this message until the vxlan tunnel is created
+        return false;
+    }
+
+    if (m_vniMapCache.find(vni_id) == m_vniMapCache.end())
+    {
+        SWSS_LOG_ERROR("VXLANRemoteTunnel: VNI %s not yet mapped", vni_id.c_str());
+        return false;
+    }
+
+    auto cache = m_vxlanRemoteVtepCache[vxlanRemoteTunnelName];
+
+    // run over all created interfaces and enable ingress replication for data plane tunnels
+    std::map<std::string, MapCache>::iterator it;
+    for (it = m_vxlanTunnelMapCache.begin(); it != m_vxlanTunnelMapCache.end(); it++)
+    {
+        size_t found = it->first.find(delimiter);
+        const auto vxlanTunnelName = it->first.substr(0, found);
+        if (vxlanTunnelName == cache.m_localVtepIp)
+        {
+            swss::VxlanMgr::VxlanInfo info;
+            std::string res;
+            info.m_vxlan = it->second.vxlan_dev_name;
+            info.m_dstIp = cache.m_localVtepIp;
+            info.m_vni = vni_id;
+            SWSS_LOG_INFO("Enable ingress replication on dev %s for ip %s vni %s", info.m_vxlan.c_str(), info.m_dstIp.c_str(), info.m_vni.c_str());
+            if (RET_SUCCESS != cmdEnableIngressReplicationOnVxlanIf(info, res))
+            {
+                SWSS_LOG_ERROR("Failed to enable learning on vxlan interface %s. res %s", info.m_vxlan.c_str(), res.c_str());
+            }
+        }
+    }
+
+
+    string key = cache.m_sourceIp + ":" + vni_id;
+    m_appVxlanRemoteVniTable.set(key, kfvFieldsValues(t));
+
+    m_vxlanRemoteTunnelMapCache[vxlanRemoteTunnelMapName] = vni_id;
+    cache.vni_refcnt++;
+
+    SWSS_LOG_INFO("VXLANRemoteTunnel: Create vxlan remote vni %s - done", vxlanRemoteTunnelMapName.c_str());
 
     return true;
 }
@@ -635,7 +877,7 @@ bool VxlanMgr::doVxlanTunnelMapDeleteTask(const KeyOpFieldsValuesTuple & t)
     }
     catch (const std::out_of_range& oor)
     {
-        SWSS_LOG_ERROR("Error deleting tunnmap : %s exception : %s", 
+        SWSS_LOG_ERROR("Error deleting tunmap : %s exception : %s", 
                       vxlanTunnelMapName.c_str(), oor.what());
         return true;
     }
@@ -643,6 +885,29 @@ bool VxlanMgr::doVxlanTunnelMapDeleteTask(const KeyOpFieldsValuesTuple & t)
     vxlan_dev_name = map_entry.vxlan_dev_name;
     vlan = map_entry.vlan;
     vni_id = map_entry.vni_id;
+
+    // for each Remote Tunnel in Remote Tunnel Map - find Tunnel Map with same VNI
+    std::string remoteVni;
+
+    for (auto it = m_vxlanRemoteTunnelMapCache.begin();
+         it != m_vxlanRemoteTunnelMapCache.end();
+         it++)
+    {
+        remoteVni = it->second;
+        if (vni_id == remoteVni)
+        {
+            std::string vxlanRemoteTunnelMapName = it->first;
+            std::string vxlanRemoteTunnelName = vxlanRemoteTunnelMapName.substr(0, vxlanRemoteTunnelMapName.find(delimiter));
+            SWSS_LOG_INFO("Found remote VTEP %s in VNI %s", vxlanRemoteTunnelName.c_str(), vni_id.c_str());
+            if (isRemoteTunnelActive(vxlanRemoteTunnelName))
+            {
+                // Need to remove associated remote tunnel map prior to removing tunnel map
+                SWSS_LOG_INFO("Vxlan tunnel map %s has associated remote tunnel map %s on vni %s", vxlanTunnelMapName.c_str(), vxlanRemoteTunnelName.c_str(), vni_id.c_str());
+                return true;
+            }
+        }
+    }
+
     downVxlanNetdevice(vxlan_dev_name);
     deleteVxlanNetdevice(vxlan_dev_name);
 
@@ -660,6 +925,102 @@ bool VxlanMgr::doVxlanTunnelMapDeleteTask(const KeyOpFieldsValuesTuple & t)
     return true;
 }
 
+bool VxlanMgr::doVxlanRemoteTunnelMapDeleteTask(const KeyOpFieldsValuesTuple & t)
+{
+    SWSS_LOG_ENTER();
+
+    std::string vxlanRemoteTunnelMapName = kfvKey(t);
+    std::replace(vxlanRemoteTunnelMapName.begin(), vxlanRemoteTunnelMapName.end(), config_db_key_delimiter, delimiter);
+
+    SWSS_LOG_INFO("VXLANRemoteTunnel: Delete vxlan remote vnip %s", vxlanRemoteTunnelMapName.c_str());
+
+    // ip link del dev {{VXLAN}}
+    size_t found = vxlanRemoteTunnelMapName.find(delimiter);
+    const auto vxlanRemoteTunnelName = vxlanRemoteTunnelMapName.substr(0, found);
+
+    // If the vxlan tunnel has been created
+    if (!isRemoteTunnelActive(vxlanRemoteTunnelName))
+    {
+        SWSS_LOG_INFO("VXLANRemoteTunnel: Vxlan remote tunnel %s has not been created", vxlanRemoteTunnelName.c_str());
+        // Suspend this message until the vxlan tunnel is created
+        return true;
+    }
+
+    std::string vni_id;
+    MapCache map_entry;
+    std::string ip_address, local_ip_address;
+
+    try
+    {
+        vni_id = m_vxlanRemoteTunnelMapCache.at(vxlanRemoteTunnelMapName);
+    }
+    catch (const std::out_of_range& oor)
+    {
+        SWSS_LOG_ERROR("VXLANRemoteTunnel: Error getting tunmap : %s exception : %s", 
+                      vxlanRemoteTunnelMapName.c_str(), oor.what());
+        return true;
+    }
+
+    try
+    {
+        ip_address = m_vxlanRemoteVtepCache[vxlanRemoteTunnelName].m_sourceIp;
+    }
+    catch (const std::out_of_range& oor)
+    {
+        SWSS_LOG_ERROR("VXLANRemoteTunnel: Error getting  tunnel : %s exception : %s", 
+                      vxlanRemoteTunnelName.c_str(), oor.what());
+        return true;
+    }
+
+    try
+    {
+        local_ip_address = m_vxlanRemoteVtepCache[vxlanRemoteTunnelName].m_localVtepIp;
+    }
+    catch (const std::out_of_range& oor)
+    {
+        SWSS_LOG_ERROR("VXLANRemoteTunnel: Error getting  tunnel : %s exception : %s", 
+                      vxlanRemoteTunnelName.c_str(), oor.what());
+        return true;
+    }
+
+    if (m_vniMapCache.find(vni_id) == m_vniMapCache.end())
+    {
+        SWSS_LOG_ERROR("VXLANRemoteTunnel: VNI %s not yet mapped", vni_id.c_str());
+        return true;
+    }
+
+    // run over all created interfaces and disable ingress replication for data plane tunnels
+    std::map<std::string, MapCache>::iterator it;
+    for (it = m_vxlanTunnelMapCache.begin(); it != m_vxlanTunnelMapCache.end(); it++)
+    {
+        size_t found = it->first.find(delimiter);
+        const auto vxlanTunnelName = it->first.substr(0, found);
+        if (vxlanTunnelName == local_ip_address)
+        {
+            swss::VxlanMgr::VxlanInfo info;
+            std::string res;
+            info.m_vxlan = it->second.vxlan_dev_name;
+            info.m_dstIp = ip_address;
+            info.m_vni = vni_id;
+            SWSS_LOG_INFO("Enable ingress replication on dev %s for ip %s vni %s", info.m_vxlan.c_str(), info.m_dstIp.c_str(), info.m_vni.c_str());
+            if (RET_SUCCESS != cmdDisableIngressReplicationOnVxlanIf(info, res))
+            {
+                SWSS_LOG_ERROR("Failed to disable learning on vxlan interface %s. res %s", info.m_vxlan.c_str(), res.c_str());
+            }
+        }
+    }
+
+    string key = ip_address + ":" + vni_id;
+    m_appVxlanRemoteVniTable.del(key);
+
+    m_vxlanRemoteTunnelMapCache.erase(vxlanRemoteTunnelMapName);
+    m_vxlanRemoteVtepCache[vxlanRemoteTunnelName].vni_refcnt--;
+
+   SWSS_LOG_INFO("VXLANRemoteTunnel: Delete vxlan remote tunnel map %s - done", vxlanRemoteTunnelMapName.c_str());
+ 
+   return true;
+}
+
 bool VxlanMgr::doVxlanEvpnNvoCreateTask(const KeyOpFieldsValuesTuple & t)
 {
     SWSS_LOG_ENTER();
@@ -671,18 +1032,25 @@ bool VxlanMgr::doVxlanEvpnNvoCreateTask(const KeyOpFieldsValuesTuple & t)
         SWSS_LOG_ERROR("Only Single NVO object allowed");
         return true;
     }
-    
+
+    // verify if there is a conflict with Dataplane tunnel
+    if (! m_vxlanRemoteVtepCache.empty())
+    {
+        SWSS_LOG_WARN("Cannot configure EVPN when Dataplane is inuse");
+        return false;
+    }
+
     for (auto i : kfvFieldsValues(t))
     {
         const std::string & field = fvField(i);
         const std::string & value = fvValue(i);
-        if (!isTunnelActive(value))
-        {
-            SWSS_LOG_ERROR("NVO %s creation failed. VTEP not present",EvpnNvoName.c_str());
-            return false;
-        }
         if (field == SOURCE_VTEP)
         {
+            if (!isTunnelActive(value))
+            {
+                SWSS_LOG_ERROR("NVO %s creation failed. VTEP %s not present",EvpnNvoName.c_str(), value.c_str());
+                return false;
+            }
             m_EvpnNvoCache[EvpnNvoName] = value;
         }
     }
@@ -948,6 +1316,8 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
     std::string link_add_cmd, link_set_master_cmd, link_up_cmd;
     std::string bridge_add_cmd, bridge_untagged_add_cmd, bridge_del_vid_cmd;
     std::string vxlan_dev_name;
+    std::string learning_cmd;
+    std::string bridge_learning_set_cmd;
 
     vxlan_dev_name = std::string("") + std::string(vxlanTunnelName) + "-" +
                      std::string(vlan_id);
@@ -988,6 +1358,16 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
     // bridge vlan add vid <vlan_id> untagged pvid dev <vxlan_dev_name>
     // ip link set <vxlan_dev_name> up
 
+    if (!m_EvpnNvoCache.empty())
+    {
+        learning_cmd = "learning off ";
+    }
+    else
+    {
+        // enable learning for Data plane tunnels
+        learning_cmd = "learning on ";
+    }
+
     link_add_cmd = std::string("") + IP_CMD + " link add " + vxlan_dev_name + 
                    " address " + gMacAddress.to_string() + " type vxlan id " + 
                    std::string(vni_id) + " local " + src_ip + 
@@ -1007,20 +1387,140 @@ int VxlanMgr::createVxlanNetdevice(std::string vxlanTunnelName, std::string vni_
 
     bridge_del_vid_cmd = std::string("") + BRIDGE_CMD + " vlan del vid 1 dev " + 
                          vxlan_dev_name;
-    
+
+    bridge_learning_set_cmd = std::string("") + BRIDGE_CMD + " link set dev " + vxlan_dev_name + " " + learning_cmd;
+
+    SWSS_LOG_INFO("Vxlan NetDevice link_add_cmd: %s", link_add_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice link_set_master_cmd: %s", link_set_master_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice link_up_cmd: %s", link_up_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice bridge_add_cmd: %s", bridge_add_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice bridge_untagged_add_cmd: %s", bridge_untagged_add_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice bridge_del_vid_cmd: %s", bridge_del_vid_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice bridge_learning_set_cmd: %s", bridge_learning_set_cmd.c_str());
     
     cmds = std::string("") + BASH_CMD + " -c \"" + 
            link_add_cmd + " && " + 
            link_set_master_cmd + " && " + 
            bridge_add_cmd + " && " + 
-           bridge_untagged_add_cmd + " && "; 
+           bridge_untagged_add_cmd; 
         
     if ( vlan_id != "1")
     {
         cmds += bridge_del_vid_cmd + " && ";
     }
 
-    cmds += link_up_cmd + "\"";
+    cmds += bridge_learning_set_cmd + " && " +
+            link_up_cmd + "\"";
+
+
+    SWSS_LOG_INFO("Run bridge commands: <%s>", cmds.c_str());
+
+    return swss::exec(cmds,res);
+}
+
+int VxlanMgr::createVxlanNetdeviceForRemoteVtep(std::string vxlanTunnelName, std::string vni_id,
+                                             std::string src_ip, std::string dst_ip,
+                                             std::string vlan_id)
+{
+    std::string res, cmds;
+    std::string link_add_cmd, link_set_master_cmd, link_up_cmd;
+    std::string bridge_add_cmd, bridge_untagged_add_cmd, bridge_del_vid_cmd;
+    std::string vxlan_dev_name;
+    std::string learning_cmd;
+    std::string bridge_learning_set_cmd;
+
+    vxlan_dev_name = std::string("") + std::string(vxlanTunnelName) + "-" +
+                     std::string(vlan_id);
+
+    SWSS_LOG_INFO("Kernel tnl_name: %s vni_id: %s src_ip: %s dst_ip:%s vlan_id: %s",
+                    vxlanTunnelName.c_str(), vni_id.c_str(), src_ip.c_str(), dst_ip.c_str(),
+                    vlan_id.c_str());
+
+    // Case 1: Entry exist - Erase from cache & return
+    // Case 2: Entry does not exist - Create netDevice in Kernel
+    // Case 3: Entry exist but modified - Not taken care. Will address later
+
+    if (m_in_reconcile)
+    {
+        auto it = m_vxlanNetDevices.find(vxlan_dev_name);
+        if (it != m_vxlanNetDevices.end())
+        {
+            m_vxlanNetDevices.erase(it);
+            SWSS_LOG_INFO("Reconcile VxlanNetDevice %s reconciled. Pending %zu",
+                            vxlan_dev_name.c_str(), m_vxlanNetDevices.size());
+            return 0;
+        }
+        else
+        {
+            SWSS_LOG_INFO("Reconcile VxlanNetDevice %s does not exist. Pending %zu",
+                            vxlan_dev_name.c_str(), m_vxlanNetDevices.size());
+        }
+    }
+    else
+    {
+        SWSS_LOG_INFO("Creating VxlanNetDevice %s", vxlan_dev_name.c_str());
+    }
+
+    // ip link add <vxlan_dev_name> type vxlan id <vni> local <src_ip> remote <dst_ip> 
+    // dstport 4789
+    // ip link set <vxlan_dev_name> master DOT1Q_BRIDGE_NAME
+    // bridge vlan add vid <vlan_id> dev <vxlan_dev_name>
+    // bridge vlan add vid <vlan_id> untagged pvid dev <vxlan_dev_name>
+    // ip link set <vxlan_dev_name> up
+
+    if (!m_EvpnNvoCache.empty())
+    {
+        learning_cmd = "learning off ";
+    }
+    else
+    {
+        // enable learning for Data plane tunnels
+        learning_cmd = "learning on ";
+    }
+
+    link_add_cmd = std::string("") + IP_CMD + " link add " + vxlan_dev_name + 
+                   " type vxlan id " + 
+                   std::string(vni_id) + " local " + src_ip + 
+                   ((dst_ip  == "")? "":(" remote " + dst_ip)) + 
+                   " nolearning " + " dstport 4789 ";
+    
+    link_set_master_cmd = std::string("") + IP_CMD + " link set " + 
+                          vxlan_dev_name + " master Bridge ";
+
+    link_up_cmd = std::string("") + IP_CMD + " link set " + vxlan_dev_name + " up ";
+
+    bridge_add_cmd = std::string("") + BRIDGE_CMD + " vlan add vid " + 
+                     std::string(vlan_id) + " dev " + vxlan_dev_name;
+
+    bridge_untagged_add_cmd = std::string("") + BRIDGE_CMD + " vlan add vid " + 
+                              std::string(vlan_id) + " untagged pvid dev " + vxlan_dev_name;
+
+    bridge_del_vid_cmd = std::string("") + BRIDGE_CMD + " vlan del vid 1 dev " + 
+                         vxlan_dev_name;
+
+    bridge_learning_set_cmd = std::string("") + BRIDGE_CMD + " link set dev " + vxlan_dev_name + " " + learning_cmd;
+
+    SWSS_LOG_INFO("Vxlan NetDevice link_add_cmd: %s", link_add_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice link_set_master_cmd: %s", link_set_master_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice link_up_cmd: %s", link_up_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice bridge_add_cmd: %s", bridge_add_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice bridge_untagged_add_cmd: %s", bridge_untagged_add_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice bridge_del_vid_cmd: %s", bridge_del_vid_cmd.c_str());
+    SWSS_LOG_INFO("Vxlan NetDevice bridge_learning_set_cmd: %s", bridge_learning_set_cmd.c_str());
+    
+    cmds = std::string("") + BASH_CMD + " -c \"" + 
+           link_add_cmd + " && " + 
+           link_set_master_cmd + " && " + 
+           bridge_add_cmd + " && " + 
+           bridge_untagged_add_cmd; 
+        
+    if ( vlan_id != "1")
+    {
+        cmds += bridge_del_vid_cmd + " && ";
+    }
+
+    cmds += bridge_learning_set_cmd +  " && " +
+            link_up_cmd + "\"";
 
     return swss::exec(cmds,res);
 }
@@ -1277,4 +1777,38 @@ bool VxlanMgr::isTunnelActive(std::string vxlanTunnelName)
     }
 
     return true;
+}
+
+bool VxlanMgr::isRemoteTunnelActive(std::string vxlanRemoteTunnelName)
+{
+    auto it = m_vxlanRemoteVtepCache.find(vxlanRemoteTunnelName);
+    if (it == m_vxlanRemoteVtepCache.end())
+    {
+        return false;
+    }
+
+    if (m_vxlanRemoteVtepCache[vxlanRemoteTunnelName].m_sourceIp == "NULL")
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool VxlanMgr::getFirstActiveTunnel(std::string &vxlanTunnelName)
+{
+    for (auto it = m_vxlanTunnelCache.begin(); it != m_vxlanTunnelCache.end(); it++)
+    {
+        if (m_vxlanTunnelCache[it->first].m_sourceIp == "NULL")
+        {
+            continue;
+        }
+
+        if (isTunnelActive(it->first))
+        {
+            vxlanTunnelName = it->first;
+            return true;
+        }
+    }
+    return false;
 }

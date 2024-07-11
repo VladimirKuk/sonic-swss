@@ -21,12 +21,13 @@ using namespace swss;
 
 #define VXLAN_BR_IF_NAME_PREFIX    "Brvxlan"
 
-FdbSync::FdbSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *config_db) :
+FdbSync::FdbSync(RedisPipeline *pipelineAppDB, DBConnector *stateDb, DBConnector *config_db, DBConnector *appDb) :
     m_fdbTable(pipelineAppDB, APP_VXLAN_FDB_TABLE_NAME),
     m_imetTable(pipelineAppDB, APP_VXLAN_REMOTE_VNI_TABLE_NAME),
     m_fdbStateTable(stateDb, STATE_FDB_TABLE_NAME),
     m_mclagRemoteFdbStateTable(stateDb, STATE_MCLAG_REMOTE_FDB_TABLE_NAME),
-    m_cfgEvpnNvoTable(config_db, CFG_VXLAN_EVPN_NVO_TABLE_NAME)
+    m_cfgEvpnNvoTable(config_db, CFG_VXLAN_EVPN_NVO_TABLE_NAME),
+    m_appDataplaneNvoTable(appDb, APP_VXLAN_DATAPLANE_VTEP_TABLE_NAME)
 {
     m_AppRestartAssist = new AppRestartAssist(pipelineAppDB, "fdbsyncd", "swss", DEFAULT_FDBSYNC_WARMSTART_TIMER);
     if (m_AppRestartAssist)
@@ -85,7 +86,18 @@ void FdbSync::processCfgEvpnNvo()
 
         if (op == SET_COMMAND)
         {
-            m_isEvpnNvoExist = true;
+            m_isEvpnNvoExist = false;
+
+            for (auto i : kfvFieldsValues(entry))
+            {
+                SWSS_LOG_INFO(" FDBSYNCD CFG EVPN NVO TABLE update : "
+                "FvFiels %s, FvValues: %s \n", fvField(i).c_str(), fvValue(i).c_str());
+
+                if(fvField(i) == "type")
+                {
+                    m_isEvpnNvoExist = true;
+                }
+            }
         }
         else if (op == DEL_COMMAND)
         {
@@ -100,8 +112,44 @@ void FdbSync::processCfgEvpnNvo()
     return;
 }
 
+
+void FdbSync::processDataplaneTunnelNvo()
+{
+    std::deque<KeyOpFieldsValuesTuple> entries;
+    m_appDataplaneNvoTable.pops(entries);
+
+    for (auto entry: entries)
+    {
+        std::string op = kfvOp(entry);
+
+        SWSS_LOG_INFO(" FDBSYNCD DATAPLANE NVO TABLE update : Op %s", op.c_str());
+
+        if (op == SET_COMMAND)
+        {
+            m_isDataplaneVxlanExist = true;
+        }
+        else if (op == DEL_COMMAND)
+        {
+            m_isDataplaneVxlanExist = false;
+        }
+
+        if (m_isDataplaneVxlanExist)
+        {
+            updateAllLocalMac();
+        }
+    }
+    return;
+}
+
 void FdbSync::updateAllLocalMac()
 {
+    if (m_isDataplaneVxlanExist)
+    {
+        m_fdb_mac.clear();
+        SWSS_LOG_DEBUG("Ignore mac update on dataplane NVO");
+        return;
+    }
+
     for ( auto it = m_fdb_mac.begin(); it != m_fdb_mac.end(); ++it )
     {
         if (m_isEvpnNvoExist)
@@ -123,6 +171,11 @@ void FdbSync::processStateFdb()
     std::deque<KeyOpFieldsValuesTuple> entries;
 
     m_fdbStateTable.pops(entries);
+
+    if (m_isDataplaneVxlanExist)
+    {
+        SWSS_LOG_INFO("Ignore STATE FDB updates on non BGP-EVPN NVO");
+    }
 
     int count =0 ;
     for (auto entry: entries)
@@ -871,6 +924,11 @@ void FdbSync::onMsg(int nlmsg_type, struct nl_object *obj)
         (nlmsg_type != RTM_NEWNEIGH) && (nlmsg_type != RTM_DELNEIGH))
     {
         SWSS_LOG_DEBUG("netlink: unhandled event: %d", nlmsg_type);
+        return;
+    }
+    if (m_isDataplaneVxlanExist)
+    {
+        SWSS_LOG_DEBUG("Ignore netlink events on dataplane NVO");
         return;
     }
     if (nlmsg_type == RTM_NEWLINK)

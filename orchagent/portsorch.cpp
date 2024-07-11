@@ -5811,6 +5811,17 @@ bool PortsOrch::setBridgePortLearnMode(Port &port, sai_bridge_port_fdb_learning_
     return true;
 }
 
+bool PortsOrch::setBridgePortLearnMode(Port &port, bool is_enable)
+{
+    SWSS_LOG_ENTER();
+
+    bool res = setBridgePortLearnMode(port, is_enable ? SAI_BRIDGE_PORT_FDB_LEARNING_MODE_HW : SAI_BRIDGE_PORT_FDB_LEARNING_MODE_DISABLE);
+
+    SWSS_LOG_NOTICE("Set bridge port %s learning %s result %d", port.m_alias.c_str(), is_enable ? "enable" : "disable", res);
+
+    return res;
+}
+
 bool PortsOrch::addVlan(string vlan_alias)
 {
     SWSS_LOG_ENTER();
@@ -6785,7 +6796,9 @@ bool PortsOrch::addTunnel(string tunnel_alias, sai_object_id_t tunnel_id, bool h
     {
         tunnel.m_learn_mode = SAI_BRIDGE_PORT_FDB_LEARNING_MODE_DISABLE;
     }
+    tunnel.m_oper_status = SAI_PORT_OPER_STATUS_DOWN;
     m_portList[tunnel_alias] = tunnel;
+    saiOidToAlias[tunnel_id] = tunnel_alias;
 
     SWSS_LOG_INFO("addTunnel:: %" PRIx64, tunnel_id);
 
@@ -6797,6 +6810,7 @@ bool PortsOrch::removeTunnel(Port tunnel)
     SWSS_LOG_ENTER();
 
     m_portList.erase(tunnel.m_alias);
+    saiOidToAlias.erase(tunnel.m_tunnel_id);
 
     return true;
 }
@@ -7662,7 +7676,7 @@ void PortsOrch::updatePortOperStatus(Port &port, sai_port_oper_status_t status)
         return;
     }
 
-    if (port.m_type == Port::PHY)
+    if (port.m_type == Port::PHY || port.m_type == Port::TUNNEL)
     {
         updateDbPortOperStatus(port, status);
         updateDbPortFlapCount(port, status);
